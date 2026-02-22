@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+#
+# build-iso.sh — Build custom Ubuntu Server 24.04 ISO for MacBook Pro A2141 (T2)
+#
+# Creates a fully automated (autoinstall) Ubuntu Server ISO with:
+#   - T2 Linux kernel + fan control (t2fanrd)
+#   - k3s Kubernetes single-node cluster
+#   - Headless server config (no suspend, lid close ignored)
+#   - SSH enabled
+#
+# Usage:
+#   1. Edit the CONFIGURATION section below
+#   2. Run: sudo bash build-iso.sh
+#   3. Flash output ISO to USB: dd if=output.iso of=/dev/sdX bs=4M status=progress
+#
+# Prerequisites (build machine):
+#   Linux: sudo apt install xorriso p7zip-full wget openssl
+#   macOS: brew install xorriso p7zip wget openssl
+#
+# MacBook pre-install steps:
+#   1. Boot macOS Recovery (Cmd+R)
+#   2. Utilities → Startup Security Utility
+#   3. Set Secure Boot → "No Security"
+#   4. Set Allowed Boot Media → "Allow booting from external or removable media"
+#   5. Plug in USB-to-Ethernet adapter
+#   6. Boot holding Option (⌥), select USB drive
+#
+set -euo pipefail
+
+# ===========================================================================
+# CONFIGURATION — Edit these values
+# ===========================================================================
+
+# Ubuntu ISO
+UBUNTU_VERSION="${UBUNTU_VERSION:-24.04.2}"
+UBUNTU_ISO_URL="https://releases.ubuntu.com/${UBUNTU_VERSION}/ubuntu-${UBUNTU_VERSION}-live-server-amd64.iso"
+UBUNTU_ISO_FILE="ubuntu-${UBUNTU_VERSION}-live-server-amd64.iso"
+
+# Output
+OUTPUT_ISO="${OUTPUT_ISO:-ubuntu-${UBUNTU_VERSION}-macbook-k8s.iso}"
+
+# Target system identity
+TARGET_HOSTNAME="${TARGET_HOSTNAME:-k8s-macbook}"
+TARGET_USERNAME="${TARGET_USERNAME:-k8s}"
+TARGET_PASSWORD="${TARGET_PASSWORD:-changeme}"   # plaintext or $6$ hash
+TARGET_TIMEZONE="${TARGET_TIMEZONE:-UTC}"
+TARGET_LOCALE="${TARGET_LOCALE:-en_US.UTF-8}"
+TARGET_KEYBOARD="${TARGET_KEYBOARD:-us}"
+
+# SSH — add your public keys (space-separated for multiple)
+# Example: SSH_KEYS=("ssh-ed25519 AAAA... user@host")
+SSH_KEYS=()
+
+# k3s
+K3S_DISABLE="${K3S_DISABLE:-traefik}"    # components to disable (comma-sep)
+K3S_TLS_SAN="${K3S_TLS_SAN:-}"           # extra TLS SANs for API server
+
+# T2 Linux — check https://wiki.t2linux.org if these go stale
+T2_REPO_URL="${T2_REPO_URL:-https://adityagarg8.github.io/t2-ubuntu-repo}"
+T2_REPO_CODENAME="${T2_REPO_CODENAME:-noble}"
+
+# ===========================================================================
+# INTERNALS — no need to edit below unless debugging
+# ===========================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR=""
+
+red()    { echo -e "\033[0;31m$*\033[0m"; }
+green()  { echo -e "\033[0;32m$*\033[0m"; }
+yellow() { echo -e "\033[0;33m$*\033[0m"; }
+info()   { echo -e "--- $*"; }
+die()    { red "ERROR: $*" >&2; exit 1; }
+
+cleanup() {
+    if [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]]; then
+        info "Cleaning up ${WORK_DIR}"
+        rm -rf "$WORK_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# ===========================================================================
+# FUNCTIONS
+# ===========================================================================
+
+check_dependencies() {
+    info "Checking dependencies..."
+    local missing=()
+    for cmd in xorriso 7z wget openssl; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        red "Missing: ${missing[*]}"
+        echo ""
+        echo "Install on Ubuntu/Debian:"
+        echo "  sudo apt install xorriso p7zip-full wget openssl"
+        echo ""
+        echo "Install on macOS:"
+        echo "  brew install xorriso p7zip wget openssl"
+        exit 1
+    fi
+    green "All dependencies found."
+}
+
+download_iso() {
+    if [[ -f "$UBUNTU_ISO_FILE" ]]; then
+        info "ISO already exists: $UBUNTU_ISO_FILE"
+        return
+    fi
+    info "Downloading Ubuntu Server ${UBUNTU_VERSION}..."
+    wget -O "$UBUNTU_ISO_FILE" "$UBUNTU_ISO_URL"
+    green "Download complete."
+}
+
+extract_iso() {
+    info "Extracting ISO..."
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/macbook-iso.XXXXXX")"
+    local extract_dir="${WORK_DIR}/iso"
+
+    7z x -y -o"${extract_dir}" "$UBUNTU_ISO_FILE" >/dev/null
+
+    # 7z creates [BOOT] dir with El Torito boot images
+    if [[ -f "${extract_dir}/[BOOT]/2-Boot-NoEmul.img" ]]; then
+        cp "${extract_dir}/[BOOT]/2-Boot-NoEmul.img" "${WORK_DIR}/efi.img"
+    else
+        die "EFI boot image not found in ISO. Is this a valid Ubuntu Server ISO?"
+    fi
+    rm -rf "${extract_dir}/[BOOT]"
+
+    # Extract MBR (first 432 bytes) for hybrid boot
+    dd if="$UBUNTU_ISO_FILE" bs=1 count=432 of="${WORK_DIR}/mbr.img" 2>/dev/null
+
+    chmod -R u+w "${extract_dir}"
+    green "ISO extracted to ${extract_dir}"
+}
+
+generate_password_hash() {
+    if [[ "$TARGET_PASSWORD" =~ ^\$6\$ ]]; then
+        PASSWORD_HASH="$TARGET_PASSWORD"
+    else
+        PASSWORD_HASH=$(openssl passwd -6 "$TARGET_PASSWORD")
+    fi
+}
+
+generate_user_data() {
+    local outfile="${WORK_DIR}/iso/server/user-data"
+    mkdir -p "$(dirname "$outfile")"
+    touch "${WORK_DIR}/iso/server/meta-data"
+
+    info "Generating autoinstall user-data..."
+
+    # --- Header ---
+    cat > "$outfile" << 'YAML'
+#cloud-config
+autoinstall:
+  version: 1
+  refresh-installer:
+    update: true
+YAML
+
+    # --- Locale / Keyboard ---
+    # shellcheck disable=SC2129
+    cat >> "$outfile" << YAML
+  locale: ${TARGET_LOCALE}
+  keyboard:
+    layout: ${TARGET_KEYBOARD}
+YAML
+
+    # --- Identity ---
+    {
+        echo "  identity:"
+        echo "    hostname: ${TARGET_HOSTNAME}"
+        echo "    username: ${TARGET_USERNAME}"
+        printf '    password: "%s"\n' "$PASSWORD_HASH"
+    } >> "$outfile"
+
+    # --- SSH ---
+    {
+        echo "  ssh:"
+        echo "    install-server: true"
+        if [[ ${#SSH_KEYS[@]} -gt 0 ]]; then
+            echo "    allow-pw: false"
+            echo "    authorized-keys:"
+            for key in "${SSH_KEYS[@]}"; do
+                echo "      - \"${key}\""
+            done
+        else
+            echo "    allow-pw: true"
+        fi
+    } >> "$outfile"
+
+    # --- Network / Storage / Packages ---
+    cat >> "$outfile" << 'YAML'
+  network:
+    version: 2
+    ethernets:
+      all-en:
+        match:
+          name: "en*"
+        dhcp4: true
+      all-eth:
+        match:
+          name: "eth*"
+        dhcp4: true
+  storage:
+    layout:
+      name: lvm
+      sizing-policy: all
+  packages:
+    - curl
+    - wget
+    - vim
+    - htop
+    - tmux
+    - net-tools
+    - lm-sensors
+    - open-iscsi
+    - nfs-common
+    - ca-certificates
+    - gnupg
+    - apt-transport-https
+  package_update: true
+  package_upgrade: true
+YAML
+
+    # --- Late-commands (during install, target at /target) ---
+    cat >> "$outfile" << 'YAML'
+  late-commands:
+    # Kernel modules for Kubernetes
+    - |
+      cat > /target/etc/modules-load.d/k8s.conf << 'EOF'
+      br_netfilter
+      overlay
+      EOF
+    # Sysctl for Kubernetes networking
+    - |
+      cat > /target/etc/sysctl.d/99-kubernetes.conf << 'EOF'
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+      EOF
+    # Disable suspend on lid close
+    - mkdir -p /target/etc/systemd/logind.conf.d
+    - |
+      cat > /target/etc/systemd/logind.conf.d/lid.conf << 'EOF'
+      [Login]
+      HandleLidSwitch=ignore
+      HandleLidSwitchExternalPower=ignore
+      HandleLidSwitchDocked=ignore
+      EOF
+    # Disable all sleep/hibernate
+    - mkdir -p /target/etc/systemd/sleep.conf.d
+    - |
+      cat > /target/etc/systemd/sleep.conf.d/nosleep.conf << 'EOF'
+      [Sleep]
+      AllowSuspend=no
+      AllowHibernation=no
+      AllowHybridSleep=no
+      AllowSuspendThenHibernate=no
+      EOF
+    # Disable swap
+    - sed -i '/\sswap\s/s/^/#/' /target/etc/fstab
+    # Console blanking for headless (blank after 30s)
+    - sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="consoleblank=30"/' /target/etc/default/grub
+    - curtin in-target --target=/target -- update-grub
+YAML
+
+    # k3s config pre-creation (needs variable injection)
+    {
+        echo "    # Pre-create k3s config"
+        echo "    - curtin in-target --target=/target -- mkdir -p /etc/rancher/k3s"
+        echo "    - |"
+        echo "      cat > /target/etc/rancher/k3s/config.yaml << 'EOF'"
+        echo "      write-kubeconfig-mode: \"0644\""
+        if [[ -n "$K3S_TLS_SAN" ]]; then
+            echo "      tls-san:"
+            IFS=',' read -ra SANS <<< "$K3S_TLS_SAN"
+            for san in "${SANS[@]}"; do
+                echo "        - \"$(echo "$san" | xargs)\""
+            done
+        fi
+        if [[ -n "$K3S_DISABLE" ]]; then
+            echo "      disable:"
+            IFS=',' read -ra COMPONENTS <<< "$K3S_DISABLE"
+            for comp in "${COMPONENTS[@]}"; do
+                echo "        - $(echo "$comp" | xargs)"
+            done
+        fi
+        echo "      EOF"
+    } >> "$outfile"
+
+    # Copy setup script from ISO to target
+    {
+        echo "    # Copy first-boot setup script"
+        echo "    - cp /cdrom/extras/macbook-setup.sh /target/opt/macbook-setup.sh"
+        echo "    - chmod +x /target/opt/macbook-setup.sh"
+    } >> "$outfile"
+
+    # --- First-boot runcmd ---
+    cat >> "$outfile" << 'YAML'
+  user-data:
+    runcmd:
+      - /opt/macbook-setup.sh
+YAML
+
+    # Inject timezone
+    cat >> "$outfile" << YAML
+    timezone: ${TARGET_TIMEZONE}
+YAML
+
+    green "user-data generated."
+}
+
+generate_setup_script() {
+    local outfile="${WORK_DIR}/iso/extras/macbook-setup.sh"
+    mkdir -p "$(dirname "$outfile")"
+
+    info "Generating first-boot setup script..."
+
+    cat > "$outfile" << SETUP_HEADER
+#!/usr/bin/env bash
+#
+# macbook-setup.sh — First-boot setup for MacBook Pro A2141
+# Installs T2 Linux kernel, fan control, and k3s
+# Log: /var/log/macbook-setup.log
+#
+set -euo pipefail
+
+MARKER="/opt/.macbook-setup-complete"
+LOG="/var/log/macbook-setup.log"
+USERNAME="${TARGET_USERNAME}"
+T2_REPO_URL="${T2_REPO_URL}"
+T2_REPO_CODENAME="${T2_REPO_CODENAME}"
+
+if [[ -f "\$MARKER" ]]; then
+    echo "Setup already completed. Remove \$MARKER to re-run."
+    exit 0
+fi
+
+exec > >(tee -a "\$LOG") 2>&1
+echo "========================================="
+echo "MacBook K8s Setup — \$(date)"
+echo "========================================="
+
+SETUP_HEADER
+
+    cat >> "$outfile" << 'SETUP_BODY'
+
+# -----------------------------------------------
+# 1. T2 Linux repository + kernel
+# -----------------------------------------------
+echo ""
+echo "[1/4] Adding T2 Linux repository..."
+
+if curl -sfL "${T2_REPO_URL}/KEY.gpg" -o /tmp/t2-key.gpg 2>/dev/null; then
+    gpg --dearmor -o /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg < /tmp/t2-key.gpg
+    echo "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] ${T2_REPO_URL} ${T2_REPO_CODENAME} main" \
+        > /etc/apt/sources.list.d/t2-linux.list
+    apt-get update -qq
+
+    echo "Installing T2 Linux kernel..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y linux-t2 2>/dev/null || {
+        echo "WARNING: linux-t2 meta-package not found."
+        echo "Trying individual kernel package..."
+        # Fallback: find the latest t2 kernel in the repo
+        T2_KERNEL=$(apt-cache search 'linux-image.*t2' | head -1 | awk '{print $1}')
+        if [[ -n "$T2_KERNEL" ]]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$T2_KERNEL"
+        else
+            echo "WARNING: No T2 kernel found. Check https://wiki.t2linux.org"
+            echo "Fan control and WiFi will not work until T2 kernel is installed."
+        fi
+    }
+else
+    echo "WARNING: Cannot reach T2 Linux repo at ${T2_REPO_URL}"
+    echo "Skipping T2 kernel install. You can re-run /opt/macbook-setup.sh later."
+fi
+
+# -----------------------------------------------
+# 2. Fan control (t2fanrd)
+# -----------------------------------------------
+echo ""
+echo "[2/4] Setting up fan control..."
+
+if apt-cache show t2fanrd &>/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y t2fanrd
+    systemctl enable t2fanrd 2>/dev/null || true
+    echo "t2fanrd installed and enabled."
+else
+    echo "WARNING: t2fanrd not in repo. Trying manual install..."
+    # Fallback: try the t2linux wiki recommended approach
+    if apt-cache show t2fand &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y t2fand
+        systemctl enable t2fand 2>/dev/null || true
+        echo "t2fand installed and enabled."
+    else
+        echo "WARNING: No T2 fan daemon found."
+        echo "CRITICAL: Without fan control the MacBook may overheat!"
+        echo "Check https://wiki.t2linux.org for manual installation."
+    fi
+fi
+
+# -----------------------------------------------
+# 3. Install k3s
+# -----------------------------------------------
+echo ""
+echo "[3/4] Installing k3s..."
+
+export INSTALL_K3S_SKIP_START=false
+curl -sfL https://get.k3s.io | sh -s -
+
+echo "Waiting for k3s to be ready..."
+TRIES=0
+until /usr/local/bin/kubectl get nodes 2>/dev/null; do
+    TRIES=$((TRIES + 1))
+    if [[ $TRIES -gt 60 ]]; then
+        echo "WARNING: k3s did not become ready in 3 minutes."
+        echo "Check: systemctl status k3s"
+        break
+    fi
+    sleep 3
+done
+
+echo "k3s node status:"
+/usr/local/bin/kubectl get nodes 2>/dev/null || true
+
+# -----------------------------------------------
+# 4. Configure user environment
+# -----------------------------------------------
+echo ""
+echo "[4/4] Configuring user environment..."
+
+# kubectl access
+if ! grep -q 'KUBECONFIG' "/home/${USERNAME}/.bashrc" 2>/dev/null; then
+    echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' >> "/home/${USERNAME}/.bashrc"
+fi
+
+# kubectl completion
+/usr/local/bin/kubectl completion bash > /etc/bash_completion.d/kubectl 2>/dev/null || true
+
+# Alias for convenience
+if ! grep -q 'alias k=' "/home/${USERNAME}/.bashrc" 2>/dev/null; then
+    echo "alias k='kubectl'" >> "/home/${USERNAME}/.bashrc"
+    echo "complete -o default -F __start_kubectl k" >> "/home/${USERNAME}/.bashrc"
+fi
+
+# -----------------------------------------------
+# Done
+# -----------------------------------------------
+echo ""
+echo "========================================="
+echo "Setup complete!"
+echo ""
+echo "  Hostname:  $(hostname)"
+echo "  User:      ${USERNAME}"
+echo "  k3s:       $(k3s --version 2>/dev/null || echo 'check manually')"
+echo "  Kernel:    $(uname -r)"
+echo ""
+echo "A reboot is needed to activate the T2 kernel."
+echo "Rebooting in 60 seconds... (cancel: shutdown -c)"
+echo "========================================="
+
+touch "$MARKER"
+shutdown -r +1 "Rebooting to activate T2 Linux kernel"
+SETUP_BODY
+
+    chmod +x "$outfile"
+    green "Setup script generated."
+}
+
+modify_grub() {
+    local extract_dir="${WORK_DIR}/iso"
+    local grub_cfg="${extract_dir}/boot/grub/grub.cfg"
+
+    info "Modifying GRUB configuration..."
+
+    if [[ ! -f "$grub_cfg" ]]; then
+        die "GRUB config not found at ${grub_cfg}"
+    fi
+
+    # Add autoinstall + nocloud datasource to all boot entries
+    sed -i 's|/casper/vmlinuz ---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ ---|g' "$grub_cfg"
+
+    # Set timeout so it auto-boots (default entry)
+    sed -i 's/^set timeout=.*/set timeout=5/' "$grub_cfg"
+
+    # Also modify loopback.cfg if present
+    local loopback="${extract_dir}/boot/grub/loopback.cfg"
+    if [[ -f "$loopback" ]]; then
+        sed -i 's|/casper/vmlinuz ---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ ---|g' "$loopback"
+    fi
+
+    green "GRUB modified for autoinstall."
+}
+
+repack_iso() {
+    local extract_dir="${WORK_DIR}/iso"
+
+    info "Repacking ISO..."
+
+    # Regenerate md5sum (optional but nice)
+    if cd "$extract_dir"; then
+        find . -type f -not -name 'md5sum.txt' -print0 | xargs -0 md5sum > md5sum.txt 2>/dev/null || true
+        cd - >/dev/null
+    fi
+
+    xorriso -as mkisofs -r \
+        -V "Ubuntu K8s MacBook" \
+        -o "${SCRIPT_DIR}/${OUTPUT_ISO}" \
+        --grub2-mbr "${WORK_DIR}/mbr.img" \
+        -partition_offset 16 \
+        --mbr-force-bootable \
+        -append_partition 2 28732ac11ff8d211ba4b00a0c93ec93b "${WORK_DIR}/efi.img" \
+        -appended_part_as_gpt \
+        -iso_mbr_part_type a2a0d0ebe5b9334487c068b6b72699c7 \
+        -c '/boot.catalog' \
+        -b '/boot/grub/i386-pc/eltorito.img' \
+            -no-emul-boot -boot-load-size 4 -boot-info-table --grub2-boot-info \
+        -eltorito-alt-boot \
+        -e '--interval:appended_partition_2:::' \
+        -no-emul-boot \
+        "$extract_dir"
+
+    green "ISO created: ${SCRIPT_DIR}/${OUTPUT_ISO}"
+}
+
+print_instructions() {
+    local iso_path="${SCRIPT_DIR}/${OUTPUT_ISO}"
+    local iso_size
+    iso_size=$(du -h "$iso_path" | cut -f1)
+
+    echo ""
+    echo "==========================================="
+    green " BUILD COMPLETE"
+    echo "==========================================="
+    echo ""
+    echo "  ISO:  ${iso_path}"
+    echo "  Size: ${iso_size}"
+    echo ""
+    echo "--- Flash to USB ---"
+    echo ""
+    echo "  Linux:"
+    echo "    sudo dd if=${OUTPUT_ISO} of=/dev/sdX bs=4M status=progress"
+    echo ""
+    echo "  macOS:"
+    echo "    sudo dd if=${OUTPUT_ISO} of=/dev/rdiskN bs=4m"
+    echo "    (find disk with: diskutil list)"
+    echo ""
+    echo "--- MacBook A2141 Boot Steps ---"
+    echo ""
+    echo "  1. Ensure Secure Boot is OFF (macOS Recovery → Startup Security Utility)"
+    echo "  2. Plug in USB-to-Ethernet adapter"
+    echo "  3. Insert USB drive"
+    echo "  4. Power on holding Option (⌥) key"
+    echo "  5. Select 'EFI Boot' (the USB drive)"
+    echo "  6. GRUB will auto-boot the installer in 5 seconds"
+    echo "  7. Installation is fully automatic (~10-15 min)"
+    echo "  8. System reboots, first-boot setup runs (~5 min)"
+    echo "  9. System reboots again (T2 kernel activation)"
+    echo " 10. SSH in: ssh ${TARGET_USERNAME}@<ip-address>"
+    echo ""
+    echo "--- Post-Install ---"
+    echo ""
+    echo "  Check setup log:  cat /var/log/macbook-setup.log"
+    echo "  Re-run setup:     rm /opt/.macbook-setup-complete && sudo /opt/macbook-setup.sh"
+    echo "  Check k3s:        kubectl get nodes"
+    echo "  Check fans:       systemctl status t2fanrd"
+    echo "  Check temps:      sensors"
+    echo ""
+    echo "--- WiFi (optional, needs macOS firmware) ---"
+    echo ""
+    echo "  The BCM4364 WiFi chip requires firmware extracted from macOS."
+    echo "  See: https://wiki.t2linux.org/guides/wifi/"
+    echo ""
+    echo "==========================================="
+}
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
+main() {
+    echo ""
+    echo "==========================================="
+    echo " MacBook Pro A2141 — Ubuntu K8s ISO Builder"
+    echo "==========================================="
+    echo ""
+    echo "  Target:   ${TARGET_HOSTNAME} (${TARGET_USERNAME})"
+    echo "  Ubuntu:   ${UBUNTU_VERSION}"
+    echo "  Output:   ${OUTPUT_ISO}"
+    echo ""
+
+    # Check if output already exists
+    if [[ -f "${SCRIPT_DIR}/${OUTPUT_ISO}" ]]; then
+        yellow "Output ISO already exists: ${OUTPUT_ISO}"
+        read -rp "Overwrite? [y/N] " confirm
+        if [[ "$confirm" != [yY] ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+        rm -f "${SCRIPT_DIR}/${OUTPUT_ISO}"
+    fi
+
+    check_dependencies
+    download_iso
+    extract_iso
+    generate_password_hash
+    generate_user_data
+    generate_setup_script
+    modify_grub
+    repack_iso
+    print_instructions
+}
+
+main "$@"

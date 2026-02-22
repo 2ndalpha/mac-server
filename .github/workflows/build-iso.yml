@@ -1,0 +1,48 @@
+name: Build ISO
+
+on:
+  pull_request:
+
+jobs:
+  validate:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck build script
+        run: shellcheck -s bash build-iso.sh
+      - name: Validate script is executable
+        run: test -x build-iso.sh
+
+  build:
+    name: Build ISO
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y xorriso p7zip-full wget openssl
+
+      - name: Extract Ubuntu version for cache key
+        id: vars
+        run: |
+          version=$(grep -oP 'UBUNTU_VERSION="\$\{UBUNTU_VERSION:-\K[^"]+(?="\})' build-iso.sh | head -1)
+          echo "ubuntu_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "iso_file=ubuntu-${version}-live-server-amd64.iso" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Ubuntu ISO
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.vars.outputs.iso_file }}
+          key: ubuntu-iso-${{ steps.vars.outputs.ubuntu_version }}
+
+      - name: Build ISO
+        run: bash build-iso.sh
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: macbook-k8s-iso
+          path: ubuntu-*-macbook-k8s.iso
+          retention-days: 7
