@@ -10,9 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck build script
-        run: shellcheck -s bash build-iso.sh build-interactive.sh
+        run: shellcheck -s bash build-iso.sh build-interactive.sh flash-efi.sh
       - name: Validate scripts are executable
-        run: test -x build-iso.sh && test -x build-interactive.sh
+        run: test -x build-iso.sh && test -x build-interactive.sh && test -x flash-efi.sh
 
   build:
     name: Build ISO (${{ matrix.os }})

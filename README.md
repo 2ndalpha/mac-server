@@ -39,7 +39,7 @@ brew install xorriso p7zip wget openssl
 ### Hardware
 
 - USB-to-Ethernet adapter (for network during install)
-- USB flash drive (4GB+)
+- USB flash drive (4GB+) or SD card with adapter
 
 ## Configure
 
@@ -70,12 +70,26 @@ This downloads the Ubuntu Server ISO (~2.5 GB, cached), injects the autoinstall 
 
 ## Flash
 
+### USB flash drive (dd)
+
 ```bash
 # Linux
 sudo dd if=ubuntu-24.04.2-macbook-k8s.iso of=/dev/sdX bs=4M status=progress
 
 # macOS (find disk with: diskutil list)
 sudo dd if=ubuntu-24.04.2-macbook-k8s.iso of=/dev/rdiskN bs=4m
+```
+
+### SD card or dd doesn't boot (flash-efi.sh)
+
+On T2 Macs, `dd`-ing a hybrid ISO to an SD card often doesn't produce bootable media — the Option boot menu ignores it because the ISO's partition layout doesn't register as valid EFI media through the SD card controller. `flash-efi.sh` works around this by creating a clean GPT + FAT32 partition with a proper `EFI/BOOT/BOOTX64.EFI` structure and copying the full ISO contents onto it:
+
+```bash
+# Find the SD card device (macOS)
+diskutil list
+
+# Flash (formats the device, copies ISO contents as EFI-bootable volume)
+sudo bash flash-efi.sh /dev/disk4
 ```
 
 ## Install
