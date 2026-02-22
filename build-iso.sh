@@ -72,6 +72,9 @@ yellow() { echo -e "\033[0;33m$*\033[0m"; }
 info()   { echo -e "--- $*"; }
 die()    { red "ERROR: $*" >&2; exit 1; }
 
+# Portable sed in-place: macOS sed requires -i '', GNU sed requires -i
+sedi() { sed -i'' -- "$@" 2>/dev/null || sed -i "$@"; }
+
 cleanup() {
     if [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]]; then
         info "Cleaning up ${WORK_DIR}"
@@ -102,6 +105,23 @@ check_dependencies() {
         echo "  brew install xorriso p7zip wget openssl"
         exit 1
     fi
+
+    # Verify SHA-512 password hashing is available (macOS LibreSSL lacks -6)
+    if [[ "$(uname)" == "Darwin" ]]; then
+        local has_sha512=false
+        for candidate in /opt/homebrew/opt/openssl/bin/openssl /usr/local/opt/openssl/bin/openssl; do
+            if [[ -x "$candidate" ]] && "$candidate" passwd -6 "test" &>/dev/null; then
+                has_sha512=true
+                break
+            fi
+        done
+        if ! $has_sha512; then
+            red "macOS LibreSSL does not support SHA-512 password hashing."
+            echo "  Install Homebrew OpenSSL: brew install openssl"
+            exit 1
+        fi
+    fi
+
     green "All dependencies found."
 }
 
@@ -140,9 +160,22 @@ extract_iso() {
 generate_password_hash() {
     if [[ "$TARGET_PASSWORD" =~ ^\$6\$ ]]; then
         PASSWORD_HASH="$TARGET_PASSWORD"
-    else
-        PASSWORD_HASH=$(openssl passwd -6 "$TARGET_PASSWORD")
+        return
     fi
+
+    # macOS LibreSSL doesn't support -6 (SHA-512), use Homebrew OpenSSL if available
+    local openssl_bin="openssl"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        for candidate in /opt/homebrew/opt/openssl/bin/openssl /usr/local/opt/openssl/bin/openssl; do
+            if [[ -x "$candidate" ]]; then
+                openssl_bin="$candidate"
+                break
+            fi
+        done
+    fi
+
+    PASSWORD_HASH=$("$openssl_bin" passwd -6 "$TARGET_PASSWORD") \
+        || die "Failed to generate password hash. On macOS, install OpenSSL: brew install openssl"
 }
 
 generate_user_data() {
@@ -482,15 +515,15 @@ modify_grub() {
     fi
 
     # Add autoinstall + nocloud datasource to all boot entries
-    sed -i 's|/casper/vmlinuz ---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ ---|g' "$grub_cfg"
+    sedi 's|/casper/vmlinuz ---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ ---|g' "$grub_cfg"
 
     # Set timeout so it auto-boots (default entry)
-    sed -i 's/^set timeout=.*/set timeout=5/' "$grub_cfg"
+    sedi 's/^set timeout=.*/set timeout=5/' "$grub_cfg"
 
     # Also modify loopback.cfg if present
     local loopback="${extract_dir}/boot/grub/loopback.cfg"
     if [[ -f "$loopback" ]]; then
-        sed -i 's|/casper/vmlinuz ---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ ---|g' "$loopback"
+        sedi 's|/casper/vmlinuz ---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ ---|g' "$loopback"
     fi
 
     green "GRUB modified for autoinstall."
