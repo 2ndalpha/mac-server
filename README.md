@@ -40,6 +40,7 @@ brew install xorriso p7zip wget openssl
 
 - USB-to-Ethernet adapter (for network during install)
 - USB flash drive (4GB+) or SD card with adapter
+- External USB keyboard (optional — only needed if manual intervention is required during install; the MacBook's internal keyboard does not work until the T2 `apple-bce` driver is loaded post-install)
 
 ## Configure
 

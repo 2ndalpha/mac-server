@@ -216,6 +216,61 @@ copy_files() {
     green "Copied (${total_size} total)."
 }
 
+ensure_grub_cfg() {
+    # If the ISO was built with updated build-iso.sh, EFI/BOOT/grub.cfg already exists.
+    # If not (e.g. older ISO), create a fallback so GRUB can find a config on FAT32.
+    if [[ -f "${VOLUME_PATH}/EFI/BOOT/grub.cfg" ]]; then
+        info "EFI/BOOT/grub.cfg already present (from ISO)."
+        return
+    fi
+
+    info "Creating EFI/BOOT/grub.cfg fallback..."
+    mkdir -p "${VOLUME_PATH}/EFI/BOOT"
+    cat > "${VOLUME_PATH}/EFI/BOOT/grub.cfg" << 'GRUB_FALLBACK'
+search --set=root --file /casper/vmlinuz
+set default=0
+set timeout=5
+
+menuentry "Install Ubuntu Server (autoinstall)" {
+    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    initrd ($root)/casper/initrd
+}
+menuentry "Install Ubuntu Server - HWE kernel (autoinstall)" {
+    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    initrd ($root)/casper/hwe-initrd
+}
+GRUB_FALLBACK
+    green "Created EFI/BOOT/grub.cfg fallback."
+}
+
+verify_boot_config() {
+    info "Verifying boot configuration..."
+    local errors=0
+
+    if [[ ! -f "${VOLUME_PATH}/EFI/BOOT/BOOTX64.EFI" ]]; then
+        red "MISSING: EFI/BOOT/BOOTX64.EFI"
+        errors=$((errors + 1))
+    fi
+
+    if [[ ! -f "${VOLUME_PATH}/EFI/BOOT/grub.cfg" ]]; then
+        red "MISSING: EFI/BOOT/grub.cfg"
+        errors=$((errors + 1))
+    elif ! grep -q 'autoinstall' "${VOLUME_PATH}/EFI/BOOT/grub.cfg"; then
+        red "EFI/BOOT/grub.cfg exists but does not contain 'autoinstall'"
+        errors=$((errors + 1))
+    fi
+
+    if [[ ! -f "${VOLUME_PATH}/server/user-data" ]]; then
+        red "MISSING: server/user-data"
+        errors=$((errors + 1))
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        die "Boot configuration verification failed (${errors} error(s)). The USB may not boot correctly."
+    fi
+    green "Boot configuration verified."
+}
+
 eject_device() {
     local device="$1"
 
@@ -315,6 +370,8 @@ main() {
     extract_iso
     format_device "$device"
     copy_files
+    ensure_grub_cfg
+    verify_boot_config
     eject_device "$device"
     print_instructions
 }
