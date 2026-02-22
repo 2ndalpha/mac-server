@@ -55,6 +55,9 @@ SSH_KEYS=()
 K3S_DISABLE="${K3S_DISABLE:-traefik}"    # components to disable (comma-sep)
 K3S_TLS_SAN="${K3S_TLS_SAN:-}"           # extra TLS SANs for API server
 
+# Tailscale
+TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"  # auth key for auto-join (optional)
+
 # T2 Linux — check https://wiki.t2linux.org if these go stale
 T2_REPO_URL="${T2_REPO_URL:-https://adityagarg8.github.io/t2-ubuntu-repo}"
 T2_REPO_CODENAME="${T2_REPO_CODENAME:-noble}"
@@ -357,7 +360,7 @@ generate_setup_script() {
 #!/usr/bin/env bash
 #
 # macbook-setup.sh — First-boot setup for MacBook Pro A2141
-# Installs T2 Linux kernel, fan control, and k3s
+# Installs T2 Linux kernel, fan control, k3s, and Tailscale
 # Log: /var/log/macbook-setup.log
 #
 set -euo pipefail
@@ -386,7 +389,7 @@ SETUP_HEADER
 # 1. T2 Linux repository + kernel
 # -----------------------------------------------
 echo ""
-echo "[1/4] Adding T2 Linux repository..."
+echo "[1/5] Adding T2 Linux repository..."
 
 if curl -sfL "${T2_REPO_URL}/KEY.gpg" -o /tmp/t2-key.gpg 2>/dev/null; then
     gpg --dearmor -o /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg < /tmp/t2-key.gpg
@@ -416,7 +419,7 @@ fi
 # 2. Fan control (t2fanrd)
 # -----------------------------------------------
 echo ""
-echo "[2/4] Setting up fan control..."
+echo "[2/5] Setting up fan control..."
 
 if apt-cache show t2fanrd &>/dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y t2fanrd
@@ -440,7 +443,7 @@ fi
 # 3. Install k3s
 # -----------------------------------------------
 echo ""
-echo "[3/4] Installing k3s..."
+echo "[3/5] Installing k3s..."
 
 export INSTALL_K3S_SKIP_START=false
 curl -sfL https://get.k3s.io | sh -s -
@@ -460,11 +463,53 @@ done
 echo "k3s node status:"
 /usr/local/bin/kubectl get nodes 2>/dev/null || true
 
+SETUP_BODY
+
+    # Tailscale section — needs variable injection for auth key
+    cat >> "$outfile" << SETUP_TAILSCALE
+
 # -----------------------------------------------
-# 4. Configure user environment
+# 4. Install Tailscale
 # -----------------------------------------------
 echo ""
-echo "[4/4] Configuring user environment..."
+echo "[4/5] Installing Tailscale..."
+
+if curl -fsSL https://tailscale.com/install.sh -o /tmp/tailscale-install.sh 2>/dev/null; then
+    sh /tmp/tailscale-install.sh
+    systemctl enable tailscaled
+    systemctl start tailscaled
+    echo "Tailscale installed and enabled."
+SETUP_TAILSCALE
+
+    if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
+        cat >> "$outfile" << SETUP_TS_AUTH
+    tailscale up --authkey=${TAILSCALE_AUTH_KEY} --advertise-routes=10.42.0.0/16,10.43.0.0/16
+    echo "Tailscale joined with auth key. Advertising k3s pod/service CIDRs."
+    echo "NOTE: Approve subnet routes in the Tailscale admin console."
+SETUP_TS_AUTH
+    else
+        cat >> "$outfile" << 'SETUP_TS_MANUAL'
+    echo "Tailscale installed but no auth key provided."
+    echo "To join your tailnet, run:"
+    echo "  sudo tailscale up --advertise-routes=10.42.0.0/16,10.43.0.0/16"
+    echo "Then approve the device and subnet routes in the Tailscale admin console."
+SETUP_TS_MANUAL
+    fi
+
+    cat >> "$outfile" << 'SETUP_TS_ELSE'
+else
+    echo "WARNING: Could not download Tailscale installer."
+    echo "Install manually later: https://tailscale.com/download/linux"
+fi
+SETUP_TS_ELSE
+
+    cat >> "$outfile" << 'SETUP_BODY'
+
+# -----------------------------------------------
+# 5. Configure user environment
+# -----------------------------------------------
+echo ""
+echo "[5/5] Configuring user environment..."
 
 # kubectl access
 if ! grep -q 'KUBECONFIG' "/home/${USERNAME}/.bashrc" 2>/dev/null; then
@@ -490,6 +535,7 @@ echo ""
 echo "  Hostname:  $(hostname)"
 echo "  User:      ${USERNAME}"
 echo "  k3s:       $(k3s --version 2>/dev/null || echo 'check manually')"
+echo "  Tailscale: $(tailscale version 2>/dev/null | head -1 || echo 'check manually')"
 echo "  Kernel:    $(uname -r)"
 echo ""
 echo "A reboot is needed to activate the T2 kernel."
