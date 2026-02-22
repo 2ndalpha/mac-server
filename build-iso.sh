@@ -55,6 +55,9 @@ SSH_KEYS=()
 K3S_DISABLE="${K3S_DISABLE:-traefik}"    # components to disable (comma-sep)
 K3S_TLS_SAN="${K3S_TLS_SAN:-}"           # extra TLS SANs for API server
 
+# Installer
+REFRESH_INSTALLER="${REFRESH_INSTALLER:-false}"  # update installer over network before starting
+
 # Tailscale
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"  # auth key for auto-join (optional)
 
@@ -193,9 +196,15 @@ generate_user_data() {
 #cloud-config
 autoinstall:
   version: 1
+YAML
+
+    # Optional: update installer over network before starting
+    if [[ "$REFRESH_INSTALLER" == "true" ]]; then
+        cat >> "$outfile" << 'YAML'
   refresh-installer:
     update: true
 YAML
+    fi
 
     # --- Locale / Keyboard ---
     # shellcheck disable=SC2129
@@ -561,16 +570,52 @@ modify_grub() {
     fi
 
     # Add autoinstall + nocloud datasource to all boot entries
-    sedi 's|/casper/vmlinuz ---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ ---|g' "$grub_cfg"
+    # Use flexible whitespace matching — Ubuntu grub.cfg may use tabs or multiple spaces
+    sedi 's|/casper/vmlinuz\(.*\)---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ \1---|g' "$grub_cfg"
+
+    # Also handle HWE kernel entries if present
+    sedi 's|/casper/hwe-vmlinuz\(.*\)---|/casper/hwe-vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ \1---|g' "$grub_cfg"
 
     # Set timeout so it auto-boots (default entry)
     sedi 's/^set timeout=.*/set timeout=5/' "$grub_cfg"
 
+    # Verify autoinstall was actually injected
+    if ! grep -q 'autoinstall' "$grub_cfg"; then
+        red "GRUB injection FAILED — 'autoinstall' not found in grub.cfg"
+        red "--- grub.cfg contents (first 50 lines) ---"
+        head -50 "$grub_cfg" >&2
+        die "sed pattern did not match any kernel boot lines. Check grub.cfg format."
+    fi
+
     # Also modify loopback.cfg if present
     local loopback="${extract_dir}/boot/grub/loopback.cfg"
     if [[ -f "$loopback" ]]; then
-        sedi 's|/casper/vmlinuz ---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ ---|g' "$loopback"
+        sedi 's|/casper/vmlinuz\(.*\)---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ \1---|g' "$loopback"
+        sedi 's|/casper/hwe-vmlinuz\(.*\)---|/casper/hwe-vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ \1---|g' "$loopback"
     fi
+
+    # Create standalone EFI/BOOT/grub.cfg fallback
+    # This is self-contained — doesn't depend on GRUB's embedded prefix resolving correctly.
+    # On T2 Macs with SD cards or FAT32 USB, the GRUB binary inside efi.img may fail to
+    # chain-load boot/grub/grub.cfg. This fallback sits next to BOOTX64.EFI where GRUB
+    # always looks as a last resort.
+    local efi_boot_dir="${extract_dir}/EFI/BOOT"
+    mkdir -p "$efi_boot_dir"
+    cat > "${efi_boot_dir}/grub.cfg" << 'GRUB_FALLBACK'
+search --set=root --file /casper/vmlinuz
+set default=0
+set timeout=5
+
+menuentry "Install Ubuntu Server (autoinstall)" {
+    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    initrd ($root)/casper/initrd
+}
+menuentry "Install Ubuntu Server - HWE kernel (autoinstall)" {
+    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    initrd ($root)/casper/hwe-initrd
+}
+GRUB_FALLBACK
+    info "Created EFI/BOOT/grub.cfg fallback."
 
     green "GRUB modified for autoinstall."
 }
