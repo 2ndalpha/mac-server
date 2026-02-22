@@ -14,6 +14,7 @@ One script turns the stock Ubuntu Server ISO into a fully automated installer th
 | Lid close | Ignored — no suspend |
 | Sleep/hibernate | Fully disabled |
 | SSH | Enabled at install time |
+| Tailscale | Installed on first boot; optional auto-join with auth key |
 | T2 kernel | Installed on first boot for hardware support |
 
 ## Prerequisites
@@ -50,12 +51,13 @@ TARGET_USERNAME="k8s"
 TARGET_PASSWORD="changeme"       # change this
 SSH_KEYS=("ssh-ed25519 AAAA...") # your public key
 K3S_TLS_SAN="192.168.1.100"     # your server IP
+TAILSCALE_AUTH_KEY="tskey-auth-..." # optional, for auto-join
 ```
 
 All settings can also be passed as environment variables:
 
 ```bash
-TARGET_PASSWORD="hunter2" K3S_TLS_SAN="k8s.local" bash build-iso.sh
+TARGET_PASSWORD="hunter2" K3S_TLS_SAN="k8s.local" TAILSCALE_AUTH_KEY="tskey-auth-..." bash build-iso.sh
 ```
 
 ## Build
@@ -83,7 +85,7 @@ sudo dd if=ubuntu-24.04.2-macbook-k8s.iso of=/dev/rdiskN bs=4m
 3. Select **EFI Boot** (the USB drive)
 4. GRUB auto-boots the installer in 5 seconds
 5. Installation runs fully unattended (~10-15 min)
-6. System reboots, first-boot setup installs T2 kernel + k3s (~5 min)
+6. System reboots, first-boot setup installs T2 kernel, k3s, and Tailscale (~5 min)
 7. System reboots once more to activate the T2 kernel
 8. SSH in: `ssh <username>@<ip-address>`
 
@@ -98,6 +100,12 @@ kubectl get nodes
 
 # Check fan control
 systemctl status t2fanrd
+
+# Check Tailscale
+tailscale status
+
+# Join tailnet manually (if no auth key was provided)
+sudo tailscale up --advertise-routes=10.42.0.0/16,10.43.0.0/16
 
 # Check temperatures
 sensors
