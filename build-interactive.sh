@@ -221,9 +221,33 @@ echo ""
 K3S_DISABLE=$(ask "Components to disable (comma-separated)" "traefik")
 K3S_TLS_SAN=$(ask "Extra TLS SANs for API server (comma-separated, or empty)" "")
 
+# ── Tailscale ─────────────────────────────────────────────────────────────────
+
+header "Step 6: Tailscale"
+
+echo -e "  ${DIM}Tailscale provides secure remote access to your server from anywhere.${RESET}"
+echo -e "  ${DIM}It can also advertise k3s pod/service CIDRs to your tailnet.${RESET}"
+echo ""
+
+TAILSCALE_AUTH_KEY=""
+if confirm "Configure Tailscale?"; then
+    echo ""
+    echo -e "  ${DIM}An auth key lets Tailscale auto-join your tailnet on first boot.${RESET}"
+    echo -e "  ${DIM}Generate one at: https://login.tailscale.com/admin/settings/keys${RESET}"
+    echo -e "  ${DIM}Leave empty to install Tailscale without auto-join (manual 'tailscale up' later).${RESET}"
+    TAILSCALE_AUTH_KEY=$(ask "Tailscale auth key (optional)" "")
+    if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
+        success "Auth key set — Tailscale will auto-join on first boot."
+    else
+        success "Tailscale will be installed. Run 'sudo tailscale up' after first boot to join."
+    fi
+else
+    info "Tailscale will not be configured."
+fi
+
 # ── Ubuntu Version ────────────────────────────────────────────────────────────
 
-header "Step 6: Ubuntu Version"
+header "Step 7: Ubuntu Version"
 
 UBUNTU_VERSION=$(ask "Ubuntu Server version" "24.04.2")
 
@@ -260,6 +284,15 @@ echo -e "  ${BOLD}Kubernetes${RESET}"
 echo -e "    Disabled:       ${CYAN}${K3S_DISABLE:-none}${RESET}"
 echo -e "    TLS SANs:       ${CYAN}${K3S_TLS_SAN:-none}${RESET}"
 echo ""
+echo -e "  ${BOLD}Tailscale${RESET}"
+if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
+    echo -e "    Auth key:       ${CYAN}(set)${RESET}"
+    echo -e "    Auto-join:      ${CYAN}yes${RESET}"
+else
+    echo -e "    Auth key:       ${YELLOW}not set${RESET}"
+    echo -e "    Auto-join:      ${YELLOW}no (manual setup)${RESET}"
+fi
+echo ""
 echo -e "  ${BOLD}Build${RESET}"
 echo -e "    Ubuntu:         ${CYAN}${UBUNTU_VERSION}${RESET}"
 echo -e "    Output:         ${CYAN}${OUTPUT_ISO}${RESET}"
@@ -280,6 +313,7 @@ echo ""
 export TARGET_HOSTNAME TARGET_USERNAME TARGET_PASSWORD
 export TARGET_TIMEZONE TARGET_LOCALE TARGET_KEYBOARD
 export K3S_DISABLE K3S_TLS_SAN
+export TAILSCALE_AUTH_KEY
 export UBUNTU_VERSION OUTPUT_ISO
 
 # SSH_KEYS is an array — build-iso.sh reads it directly, so we source-export it
