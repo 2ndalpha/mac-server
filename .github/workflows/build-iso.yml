@@ -10,24 +10,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck build script
-        run: shellcheck -s bash build-iso.sh
-      - name: Validate script is executable
-        run: test -x build-iso.sh
+        run: shellcheck -s bash build-iso.sh build-interactive.sh
+      - name: Validate scripts are executable
+        run: test -x build-iso.sh && test -x build-interactive.sh
 
   build:
-    name: Build ISO
+    name: Build ISO (${{ matrix.os }})
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y xorriso p7zip-full wget openssl
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install xorriso p7zip wget openssl
 
       - name: Extract Ubuntu version for cache key
         id: vars
         run: |
-          version=$(grep -oP 'UBUNTU_VERSION="\$\{UBUNTU_VERSION:-\K[^"]+(?="\})' build-iso.sh | head -1)
+          version=$(grep -oP 'UBUNTU_VERSION="\$\{UBUNTU_VERSION:-\K[^"]+(?="\})' build-iso.sh 2>/dev/null \
+            || grep 'UBUNTU_VERSION=' build-iso.sh | head -1 | sed 's/.*:-//;s/".*//')
           echo "ubuntu_version=${version}" >> "$GITHUB_OUTPUT"
           echo "iso_file=ubuntu-${version}-live-server-amd64.iso" >> "$GITHUB_OUTPUT"
 
@@ -43,6 +52,6 @@ jobs:
       - name: Upload ISO
         uses: actions/upload-artifact@v4
         with:
-          name: macbook-k8s-iso
+          name: macbook-k8s-iso-${{ matrix.os }}
           path: ubuntu-*-macbook-k8s.iso
           retention-days: 7
