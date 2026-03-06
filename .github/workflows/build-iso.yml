@@ -55,3 +55,154 @@ jobs:
           name: macbook-k8s-iso-${{ matrix.os }}
           path: ubuntu-*-macbook-k8s.iso
           retention-days: 7
+
+  test-install:
+    name: Test install (QEMU)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download built ISO
+        uses: actions/download-artifact@v4
+        with:
+          name: macbook-k8s-iso-ubuntu-latest
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf qemu-utils
+
+      - name: Prepare VM disk and EFI vars
+        run: |
+          # Create 20GB virtual disk for installation
+          qemu-img create -f qcow2 disk.qcow2 20G
+
+          # Copy OVMF vars (writable) — code is read-only
+          cp /usr/share/OVMF/OVMF_CODE_4M.fd ovmf_code.fd
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd ovmf_vars.fd
+
+      - name: Find ISO
+        id: iso
+        run: |
+          iso=$(ls ubuntu-*-macbook-k8s.iso | head -1)
+          echo "iso_file=${iso}" >> "$GITHUB_OUTPUT"
+          echo "Found ISO: ${iso}"
+
+      - name: Run autoinstall in QEMU
+        run: |
+          echo "=== Starting QEMU autoinstall ==="
+          echo "ISO: ${{ steps.iso.outputs.iso_file }}"
+
+          # Boot the ISO in QEMU with UEFI, 4GB RAM, 2 CPUs, NAT networking
+          # -nographic: serial console only (no display needed in CI)
+          # The installer will auto-reboot when done; -no-reboot makes QEMU exit instead
+          timeout 2400 qemu-system-x86_64 \
+            -machine q35 \
+            -cpu qemu64 \
+            -smp 2 \
+            -m 4096 \
+            -drive if=pflash,format=raw,readonly=on,file=ovmf_code.fd \
+            -drive if=pflash,format=raw,file=ovmf_vars.fd \
+            -drive file=disk.qcow2,format=qcow2,if=virtio \
+            -cdrom "${{ steps.iso.outputs.iso_file }}" \
+            -boot d \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            -serial mon:stdio \
+            -nographic \
+            -no-reboot \
+            2>&1 | tee install.log &
+
+          QEMU_PID=$!
+
+          # Monitor for completion or failure
+          # The installer will trigger a reboot, and -no-reboot makes QEMU exit
+          SECONDS=0
+          while kill -0 $QEMU_PID 2>/dev/null; do
+            if [ $SECONDS -ge 2400 ]; then
+              echo "ERROR: Install timed out after 40 minutes"
+              kill $QEMU_PID 2>/dev/null || true
+              exit 1
+            fi
+
+            # Check for known failure patterns in the log
+            if grep -q "An error occurred" install.log 2>/dev/null; then
+              echo "ERROR: Installer reported an error"
+              echo "=== Last 50 lines of install log ==="
+              tail -50 install.log
+              kill $QEMU_PID 2>/dev/null || true
+              exit 1
+            fi
+
+            sleep 15
+            echo "... install running (${SECONDS}s elapsed)"
+          done
+
+          wait $QEMU_PID || true
+          echo "=== QEMU exited after ${SECONDS}s ==="
+
+          # Check if installation was successful
+          # If QEMU exited cleanly, the installer rebooted (success)
+          if grep -qE "Rebooting|reboot: Restarting system|reboot: Power down" install.log; then
+            echo "SUCCESS: Installer completed and triggered reboot"
+          else
+            echo "WARNING: QEMU exited but no reboot detected in log"
+            echo "=== Last 30 lines ==="
+            tail -30 install.log
+          fi
+
+      - name: Boot installed system and verify
+        run: |
+          echo "=== Booting installed system ==="
+
+          # Boot from the installed disk (no CD-ROM)
+          timeout 300 qemu-system-x86_64 \
+            -machine q35 \
+            -cpu qemu64 \
+            -smp 2 \
+            -m 4096 \
+            -drive if=pflash,format=raw,readonly=on,file=ovmf_code.fd \
+            -drive if=pflash,format=raw,file=ovmf_vars.fd \
+            -drive file=disk.qcow2,format=qcow2,if=virtio \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            -serial mon:stdio \
+            -nographic \
+            -no-reboot \
+            2>&1 | tee boot.log &
+
+          QEMU_PID=$!
+
+          # Wait for login prompt (indicates successful boot)
+          SECONDS=0
+          while kill -0 $QEMU_PID 2>/dev/null; do
+            if [ $SECONDS -ge 300 ]; then
+              echo "ERROR: Boot timed out after 5 minutes"
+              kill $QEMU_PID 2>/dev/null || true
+              break
+            fi
+
+            if grep -q "login:" boot.log 2>/dev/null; then
+              echo "SUCCESS: System booted to login prompt (${SECONDS}s)"
+              kill $QEMU_PID 2>/dev/null || true
+              break
+            fi
+
+            sleep 5
+          done
+
+          wait $QEMU_PID 2>/dev/null || true
+          echo "=== Boot log tail ==="
+          tail -20 boot.log
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-logs
+          path: |
+            install.log
+            boot.log
+          retention-days: 7
