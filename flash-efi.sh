@@ -232,11 +232,11 @@ set default=0
 set timeout=5
 
 menuentry "Install Ubuntu Server (autoinstall)" {
-    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat quiet ---
     initrd ($root)/casper/initrd
 }
 menuentry "Install Ubuntu Server - HWE kernel (autoinstall)" {
-    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat quiet ---
     initrd ($root)/casper/hwe-initrd
 }
 GRUB_FALLBACK

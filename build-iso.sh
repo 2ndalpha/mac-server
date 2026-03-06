@@ -206,6 +206,15 @@ YAML
 YAML
     fi
 
+    # --- Early commands (run before network probing) ---
+    cat >> "$outfile" << 'YAML'
+  early-commands:
+    - modprobe -r cdc_ether 2>/dev/null || true
+    - modprobe r8152 2>/dev/null || true
+    - modprobe ax88179_178a 2>/dev/null || true
+    - sleep 3  # wait for USB ethernet device nodes to stabilize
+YAML
+
     # --- Locale / Keyboard ---
     # shellcheck disable=SC2129
     cat >> "$outfile" << YAML
@@ -255,20 +264,9 @@ YAML
       name: lvm
       sizing-policy: all
   packages:
-    - curl
     - wget
-    - vim
-    - htop
-    - tmux
-    - net-tools
-    - lm-sensors
-    - open-iscsi
-    - nfs-common
-    - ca-certificates
-    - gnupg
-    - apt-transport-https
-  package_update: true
-  package_upgrade: true
+  package_update: false
+  package_upgrade: false
 YAML
 
     # --- Late-commands (during install, target at /target) ---
@@ -344,16 +342,30 @@ YAML
         echo "    - chmod +x /target/opt/macbook-setup.sh"
     } >> "$outfile"
 
+    # --- Error commands (dump diagnostics to boot media for debugging) ---
+    cat >> "$outfile" << 'YAML'
+  error-commands:
+    # NOTE: remount,rw only works on FAT32 boot media (flash-efi.sh); silently fails on ISO9660
+    - mount -o remount,rw /cdrom 2>/dev/null || true
+    - mkdir -p /cdrom/debug
+    - ip a > /cdrom/debug/network.log 2>&1 || true
+    - lsusb > /cdrom/debug/usb-devices.log 2>&1 || true
+    - dmesg | grep -iE 'r8152|cdc|ax88|eth|usb|net' > /cdrom/debug/dmesg-net.log 2>&1 || true
+    - cat /var/log/installer/curtin-install.log > /cdrom/debug/curtin-install.log 2>&1 || true
+    - ls -la /cdrom/ > /cdrom/debug/cdrom-permissions.log 2>&1 || true
+    - ls -laR /cdrom/dists/ >> /cdrom/debug/cdrom-permissions.log 2>&1 || true
+YAML
+
+    # Inject timezone (top-level autoinstall key)
+    cat >> "$outfile" << YAML
+  timezone: ${TARGET_TIMEZONE}
+YAML
+
     # --- First-boot runcmd ---
     cat >> "$outfile" << 'YAML'
   user-data:
     runcmd:
       - /opt/macbook-setup.sh
-YAML
-
-    # Inject timezone
-    cat >> "$outfile" << YAML
-    timezone: ${TARGET_TIMEZONE}
 YAML
 
     green "user-data generated."
@@ -369,7 +381,7 @@ generate_setup_script() {
 #!/usr/bin/env bash
 #
 # macbook-setup.sh — First-boot setup for MacBook Pro A2141
-# Installs T2 Linux kernel, fan control, k3s, and Tailscale
+# Installs system packages, T2 Linux kernel, fan control, k3s, and Tailscale
 # Log: /var/log/macbook-setup.log
 #
 set -euo pipefail
@@ -395,10 +407,25 @@ SETUP_HEADER
     cat >> "$outfile" << 'SETUP_BODY'
 
 # -----------------------------------------------
-# 1. T2 Linux repository + kernel
+# 1. System packages (moved from autoinstall for offline-safe ISO)
 # -----------------------------------------------
 echo ""
-echo "[1/5] Adding T2 Linux repository..."
+echo "[1/6] Installing system packages..."
+
+apt-get update || {
+    echo "WARNING: apt-get update failed, retrying in 10s..."
+    sleep 10
+    apt-get update
+}
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    curl vim htop tmux net-tools lm-sensors \
+    open-iscsi nfs-common ca-certificates gnupg apt-transport-https
+
+# -----------------------------------------------
+# 2. T2 Linux repository + kernel
+# -----------------------------------------------
+echo ""
+echo "[2/6] Adding T2 Linux repository..."
 
 if curl -sfL "${T2_REPO_URL}/KEY.gpg" -o /tmp/t2-key.gpg 2>/dev/null; then
     gpg --dearmor -o /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg < /tmp/t2-key.gpg
@@ -424,11 +451,15 @@ else
     echo "Skipping T2 kernel install. You can re-run /opt/macbook-setup.sh later."
 fi
 
+# System upgrade (after T2 kernel so upgrades apply on the correct kernel base)
+echo "Running system upgrade..."
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y || echo "WARNING: System upgrade failed, continuing..."
+
 # -----------------------------------------------
-# 2. Fan control (t2fanrd)
+# 3. Fan control (t2fanrd)
 # -----------------------------------------------
 echo ""
-echo "[2/5] Setting up fan control..."
+echo "[3/6] Setting up fan control..."
 
 if apt-cache show t2fanrd &>/dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y t2fanrd
@@ -449,10 +480,10 @@ else
 fi
 
 # -----------------------------------------------
-# 3. Install k3s
+# 4. Install k3s
 # -----------------------------------------------
 echo ""
-echo "[3/5] Installing k3s..."
+echo "[4/6] Installing k3s..."
 
 export INSTALL_K3S_SKIP_START=false
 curl -sfL https://get.k3s.io | sh -s -
@@ -478,10 +509,10 @@ SETUP_BODY
     cat >> "$outfile" << SETUP_TAILSCALE
 
 # -----------------------------------------------
-# 4. Install Tailscale
+# 5. Install Tailscale
 # -----------------------------------------------
 echo ""
-echo "[4/5] Installing Tailscale..."
+echo "[5/6] Installing Tailscale..."
 
 if curl -fsSL https://tailscale.com/install.sh -o /tmp/tailscale-install.sh 2>/dev/null; then
     sh /tmp/tailscale-install.sh
@@ -515,10 +546,10 @@ SETUP_TS_ELSE
     cat >> "$outfile" << 'SETUP_BODY'
 
 # -----------------------------------------------
-# 5. Configure user environment
+# 6. Configure user environment
 # -----------------------------------------------
 echo ""
-echo "[5/5] Configuring user environment..."
+echo "[6/6] Configuring user environment..."
 
 # kubectl access
 if ! grep -q 'KUBECONFIG' "/home/${USERNAME}/.bashrc" 2>/dev/null; then
@@ -569,12 +600,16 @@ modify_grub() {
         die "GRUB config not found at ${grub_cfg}"
     fi
 
-    # Add autoinstall + nocloud datasource to all boot entries
+    # Add autoinstall + nocloud datasource + T2/USB compatibility params to all boot entries
+    # - modprobe.blacklist=cdc_ether: prevent generic driver from stealing USB ethernet (RTL8153)
+    # - usbcore.autosuspend=-1: prevent USB hubs from power-saving disconnects
+    # - pcie_ports=compat: improve Thunderbolt/PCIe stability on T2 Macs
     # Use flexible whitespace matching — Ubuntu grub.cfg may use tabs or multiple spaces
-    sedi 's|/casper/vmlinuz\(.*\)---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ \1---|g' "$grub_cfg"
+    local kernel_params="autoinstall ds=nocloud\\\\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat"
+    sedi "s|/casper/vmlinuz\(.*\)---|/casper/vmlinuz ${kernel_params} \1---|g" "$grub_cfg"
 
     # Also handle HWE kernel entries if present
-    sedi 's|/casper/hwe-vmlinuz\(.*\)---|/casper/hwe-vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ \1---|g' "$grub_cfg"
+    sedi "s|/casper/hwe-vmlinuz\(.*\)---|/casper/hwe-vmlinuz ${kernel_params} \1---|g" "$grub_cfg"
 
     # Set timeout so it auto-boots (default entry)
     sedi 's/^set timeout=.*/set timeout=5/' "$grub_cfg"
@@ -590,8 +625,8 @@ modify_grub() {
     # Also modify loopback.cfg if present
     local loopback="${extract_dir}/boot/grub/loopback.cfg"
     if [[ -f "$loopback" ]]; then
-        sedi 's|/casper/vmlinuz\(.*\)---|/casper/vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ \1---|g' "$loopback"
-        sedi 's|/casper/hwe-vmlinuz\(.*\)---|/casper/hwe-vmlinuz autoinstall ds=nocloud\\;s=/cdrom/server/ \1---|g' "$loopback"
+        sedi "s|/casper/vmlinuz\(.*\)---|/casper/vmlinuz ${kernel_params} \1---|g" "$loopback"
+        sedi "s|/casper/hwe-vmlinuz\(.*\)---|/casper/hwe-vmlinuz ${kernel_params} \1---|g" "$loopback"
     fi
 
     # Create standalone EFI/BOOT/grub.cfg fallback
@@ -607,11 +642,11 @@ set default=0
 set timeout=5
 
 menuentry "Install Ubuntu Server (autoinstall)" {
-    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat quiet ---
     initrd ($root)/casper/initrd
 }
 menuentry "Install Ubuntu Server - HWE kernel (autoinstall)" {
-    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat quiet ---
     initrd ($root)/casper/hwe-initrd
 }
 GRUB_FALLBACK
@@ -631,8 +666,11 @@ repack_iso() {
         cd - >/dev/null
     fi
 
+    # -dir-mode/-file-mode: ensure _apt user can read /cdrom during install (LP#1963725)
     xorriso -as mkisofs -r \
         -V "Ubuntu K8s MacBook" \
+        -dir-mode 0755 \
+        -file-mode 0644 \
         -o "${SCRIPT_DIR}/${OUTPUT_ISO}" \
         --grub2-mbr "${WORK_DIR}/mbr.img" \
         -partition_offset 16 \
