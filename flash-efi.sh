@@ -195,8 +195,9 @@ copy_files() {
     info "Copying ISO contents to ${VOLUME_PATH}..."
 
     # Copy everything from the extracted ISO
-    # Use cp -a to preserve structure; exclude [BOOT] which we already cleaned up
-    cp -a "${extract_dir}/." "${VOLUME_PATH}/"
+    # Use rsync instead of cp -a: FAT32 doesn't support xattrs/ACLs/permissions,
+    # causing cp -a to fail with "Device not configured" and "Operation not permitted"
+    rsync -r "${extract_dir}/" "${VOLUME_PATH}/"
 
     # Ensure the EFI binary is at the canonical path
     if [[ ! -f "${VOLUME_PATH}/EFI/BOOT/BOOTX64.EFI" ]]; then
