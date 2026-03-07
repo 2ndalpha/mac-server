@@ -315,7 +315,7 @@ YAML
     # Disable swap
     - sed -i '/\sswap\s/s/^/#/' /target/etc/fstab
     # Console blanking for headless (blank after 30s)
-    - sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="consoleblank=30"/' /target/etc/default/grub
+    - sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="consoleblank=30 console=ttyS0,115200n8"/' /target/etc/default/grub
     - curtin in-target --target=/target -- update-grub
 YAML
 
