@@ -591,6 +591,108 @@ SETUP_BODY
     green "Setup script generated."
 }
 
+generate_upload_logs_script() {
+    local outfile="${WORK_DIR}/iso/extras/upload-logs.sh"
+
+    info "Generating log upload script..."
+
+    cat > "$outfile" << 'UPLOAD_SCRIPT'
+#!/usr/bin/env bash
+#
+# upload-logs.sh — Collect and upload installer debug logs
+#
+# Run from the installer shell (Alt+F2) when installation fails.
+# Collects all relevant logs, compresses them, and uploads to a
+# temporary file sharing service. Prints a URL to share.
+#
+set -euo pipefail
+
+LOGDIR="/tmp/debug-logs"
+ARCHIVE="/tmp/installer-debug-$(date +%Y%m%d-%H%M%S).tar.gz"
+
+echo "=== Collecting installer debug logs ==="
+mkdir -p "$LOGDIR"
+
+# Installer logs
+cp /var/log/installer/curtin-install.log "$LOGDIR/" 2>/dev/null || true
+cp /var/log/installer/subiquity-server-debug.log "$LOGDIR/" 2>/dev/null || true
+cp /var/log/installer/subiquity-client-debug.log "$LOGDIR/" 2>/dev/null || true
+cp /var/log/syslog "$LOGDIR/" 2>/dev/null || true
+cp /var/log/cloud-init.log "$LOGDIR/" 2>/dev/null || true
+
+# Crash reports
+cp /var/crash/*.crash "$LOGDIR/" 2>/dev/null || true
+
+# Autoinstall config (as resolved by the installer)
+cp /autoinstall.yaml "$LOGDIR/" 2>/dev/null || true
+
+# Network state
+ip a > "$LOGDIR/ip-addr.log" 2>&1 || true
+ip route > "$LOGDIR/ip-route.log" 2>&1 || true
+cat /etc/resolv.conf > "$LOGDIR/resolv.conf" 2>&1 || true
+
+# Hardware (these may or may not be in the live environment)
+lsusb > "$LOGDIR/lsusb.log" 2>/dev/null || true
+lspci > "$LOGDIR/lspci.log" 2>/dev/null || true
+lsblk > "$LOGDIR/lsblk.log" 2>/dev/null || true
+
+# Kernel messages
+dmesg > "$LOGDIR/dmesg-full.log" 2>&1 || true
+
+# Boot media
+ls -la /cdrom/ > "$LOGDIR/cdrom-listing.log" 2>&1 || true
+ls -laR /cdrom/dists/ >> "$LOGDIR/cdrom-listing.log" 2>&1 || true
+cat /cdrom/server/user-data > "$LOGDIR/user-data.yaml" 2>&1 || true
+
+# Disk state
+df -h > "$LOGDIR/df.log" 2>&1 || true
+
+echo "=== Compressing logs ==="
+tar czf "$ARCHIVE" -C /tmp "$(basename "$LOGDIR")"
+SIZE=$(du -h "$ARCHIVE" | cut -f1)
+echo "Archive: $ARCHIVE ($SIZE)"
+
+echo ""
+echo "=== Uploading ==="
+
+# Use wget (available in installer) — curl may not be installed
+# Try multiple upload services as fallback
+URL=""
+
+# Try transfer.archivete.am (wget --post-file for upload)
+if [ -z "$URL" ] && command -v wget >/dev/null 2>&1; then
+    URL=$(wget -qO- --method=PUT --body-file="$ARCHIVE" "https://transfer.archivete.am/$(basename "$ARCHIVE")" 2>/dev/null) || URL=""
+fi
+
+# Try with curl if wget didn't work
+if [ -z "$URL" ] && command -v curl >/dev/null 2>&1; then
+    URL=$(curl -sf --upload-file "$ARCHIVE" "https://transfer.archivete.am/$(basename "$ARCHIVE")" 2>/dev/null) || URL=""
+fi
+
+if [ -n "$URL" ]; then
+    echo ""
+    echo "==========================================="
+    echo "  Logs uploaded successfully!"
+    echo ""
+    echo "  URL: $URL"
+    echo ""
+    echo "  Share this URL for debugging."
+    echo "==========================================="
+else
+    echo ""
+    echo "==========================================="
+    echo "  Upload failed (no network?)"
+    echo ""
+    echo "  Logs saved locally at: $ARCHIVE"
+    echo "  Copy manually via USB if needed."
+    echo "==========================================="
+fi
+UPLOAD_SCRIPT
+
+    chmod +x "$outfile"
+    green "Log upload script generated."
+}
+
 modify_grub() {
     local extract_dir="${WORK_DIR}/iso"
     local grub_cfg="${extract_dir}/boot/grub/grub.cfg"
@@ -777,6 +879,7 @@ main() {
     generate_password_hash
     generate_user_data
     generate_setup_script
+    generate_upload_logs_script
     modify_grub
     repack_iso
     print_instructions
