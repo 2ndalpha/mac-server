@@ -264,13 +264,6 @@ YAML
     layout:
       name: lvm
       sizing-policy: all
-  apt:
-    disable_components: []
-    preserve_sources_list: false
-    primary:
-      - arches: [amd64]
-        uri: "http://archive.ubuntu.com/ubuntu"
-    geoip: false
   packages:
     - wget
   package_update: false
