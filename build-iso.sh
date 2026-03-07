@@ -613,7 +613,7 @@ modify_grub() {
     # - usbcore.autosuspend=-1: prevent USB hubs from power-saving disconnects
     # - pcie_ports=compat: improve Thunderbolt/PCIe stability on T2 Macs
     # Use flexible whitespace matching — Ubuntu grub.cfg may use tabs or multiple spaces
-    local kernel_params="autoinstall ds=nocloud\\\\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat"
+    local kernel_params="autoinstall ds=nocloud\\\\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat console=ttyS0,115200n8"
     sedi "s|/casper/vmlinuz\(.*\)---|/casper/vmlinuz ${kernel_params} \1---|g" "$grub_cfg"
 
     # Also handle HWE kernel entries if present
@@ -650,11 +650,11 @@ set default=0
 set timeout=5
 
 menuentry "Install Ubuntu Server (autoinstall)" {
-    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat quiet ---
+    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat console=ttyS0,115200n8 quiet ---
     initrd ($root)/casper/initrd
 }
 menuentry "Install Ubuntu Server - HWE kernel (autoinstall)" {
-    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat quiet ---
+    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat console=ttyS0,115200n8 quiet ---
     initrd ($root)/casper/hwe-initrd
 }
 GRUB_FALLBACK
@@ -766,10 +766,14 @@ main() {
     # Check if output already exists
     if [[ -f "${SCRIPT_DIR}/${OUTPUT_ISO}" ]]; then
         yellow "Output ISO already exists: ${OUTPUT_ISO}"
-        read -rp "Overwrite? [y/N] " confirm
-        if [[ "$confirm" != [yY] ]]; then
-            echo "Aborted."
-            exit 0
+        if [[ -t 0 ]]; then
+            read -rp "Overwrite? [y/N] " confirm
+            if [[ "$confirm" != [yY] ]]; then
+                echo "Aborted."
+                exit 0
+            fi
+        else
+            info "Non-interactive mode — overwriting."
         fi
         rm -f "${SCRIPT_DIR}/${OUTPUT_ISO}"
     fi
