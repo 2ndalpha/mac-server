@@ -195,8 +195,9 @@ copy_files() {
     info "Copying ISO contents to ${VOLUME_PATH}..."
 
     # Copy everything from the extracted ISO
-    # Use cp -a to preserve structure; exclude [BOOT] which we already cleaned up
-    cp -a "${extract_dir}/." "${VOLUME_PATH}/"
+    # Use rsync instead of cp -a: FAT32 doesn't support xattrs/ACLs/permissions,
+    # causing cp -a to fail with "Device not configured" and "Operation not permitted"
+    rsync -r "${extract_dir}/" "${VOLUME_PATH}/"
 
     # Ensure the EFI binary is at the canonical path
     if [[ ! -f "${VOLUME_PATH}/EFI/BOOT/BOOTX64.EFI" ]]; then
@@ -232,11 +233,11 @@ set default=0
 set timeout=5
 
 menuentry "Install Ubuntu Server (autoinstall)" {
-    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    linux ($root)/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat console=hvc0 console=tty0 quiet ---
     initrd ($root)/casper/initrd
 }
 menuentry "Install Ubuntu Server - HWE kernel (autoinstall)" {
-    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ quiet ---
+    linux ($root)/casper/hwe-vmlinuz autoinstall ds=nocloud\;s=/cdrom/server/ modprobe.blacklist=cdc_ether usbcore.autosuspend=-1 pcie_ports=compat console=hvc0 console=tty0 quiet ---
     initrd ($root)/casper/hwe-initrd
 }
 GRUB_FALLBACK
