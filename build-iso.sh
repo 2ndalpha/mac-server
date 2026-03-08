@@ -432,7 +432,12 @@ if curl -sfL "${T2_REPO_URL}/KEY.gpg" -o /tmp/t2-key.gpg 2>/dev/null; then
     gpg --dearmor -o /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg < /tmp/t2-key.gpg
     echo "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] ${T2_REPO_URL} ${T2_REPO_CODENAME} main" \
         > /etc/apt/sources.list.d/t2-linux.list
-    apt-get update -qq
+    if ! apt-get update -qq; then
+        echo "WARNING: apt-get update failed (T2 repo may be unavailable)."
+        echo "Removing broken T2 repo source and continuing without T2 kernel..."
+        rm -f /etc/apt/sources.list.d/t2-linux.list
+        apt-get update -qq || true
+    fi
 
     echo "Installing T2 Linux kernel..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y linux-t2 2>/dev/null || {
